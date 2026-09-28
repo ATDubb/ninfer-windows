@@ -135,6 +135,11 @@ PressurePlanningSession::maximal_target(runtime::PlanningCandidateId candidate) 
     return impl_->maximal_target(candidate);
 }
 
+PressureTargetHandle PressurePlanningSession::retention_target(
+    runtime::PlanningCandidateId candidate, std::span<const runtime::PlanningOwnerId> evict) {
+    return impl_->retention_target(candidate, evict);
+}
+
 PressureConstructionCursor PressurePlanningSession::begin_construction(PressureTargetHandle target,
                                                                        bool restore) {
     return impl_->begin_construction(target, restore);

@@ -559,6 +559,8 @@ public:
     [[nodiscard]] FakePressureTargetHandle root_maximal_target(PlanningCandidateId candidate);
     struct Cursor;
     [[nodiscard]] FakePressureTargetHandle maximal_target(PlanningCandidateId candidate);
+    [[nodiscard]] FakePressureTargetHandle retention_target(
+        PlanningCandidateId candidate, std::span<const PlanningOwnerId> evict);
     [[nodiscard]] Cursor begin_construction(FakePressureTargetHandle target, bool restore = false);
     [[nodiscard]] ninfer::runtime::PressureConstructionStep
     next_construction_option(Cursor& cursor);
@@ -1364,6 +1366,40 @@ FakePressurePlanningSession::maximal_target(PlanningCandidateId candidate) {
     const auto target                   = root_maximal_target(candidate);
     targets_[target.index].root_maximal = false;
     return target;
+}
+
+FakePressureTargetHandle FakePressurePlanningSession::retention_target(
+    PlanningCandidateId candidate, std::span<const PlanningOwnerId> evict) {
+    const auto selected = candidate_index(candidate);
+    populate_options(selected);
+    Target target{.candidate_index = selected,
+                  .choices = std::vector<std::uint16_t>(owners_.size(), 0)};
+    bool any_eligible = false, all_evicted = true;
+    for (std::size_t i = 0; i < owners_.size(); ++i) {
+        const auto& options = options_[selected][i];
+        const bool release = std::find(evict.begin(), evict.end(), owners_[i].id) != evict.end();
+        const auto choice = std::find_if(options.begin(), options.end(), [&](const auto& option) {
+            return option.evicts_continuation == release;
+        });
+        if (choice != options.end()) {
+            target.choices[i] = static_cast<std::uint16_t>(1 + choice - options.begin());
+        }
+        if (!options.empty()) {
+            any_eligible = true;
+            all_evicted = all_evicted && release;
+        }
+    }
+    target.root_maximal = any_eligible && all_evicted;
+    const auto found = std::find_if(targets_.begin(), targets_.end(),
+                                   [&](const auto& prior) { return same_target(prior, target); });
+    if (found != targets_.end()) {
+        found->root_maximal = found->root_maximal || target.root_maximal;
+        return {.generation = generation_, .index = static_cast<std::uint32_t>(found - targets_.begin())};
+    }
+    target.stable_ordinal = static_cast<std::uint32_t>(targets_.size());
+    targets_.push_back(std::move(target));
+    program_->pressure_target_count_peak = std::max(program_->pressure_target_count_peak, targets_.size());
+    return {.generation = generation_, .index = static_cast<std::uint32_t>(targets_.size() - 1)};
 }
 
 FakePressurePlanningSession::Cursor
@@ -2820,6 +2856,81 @@ void test_guided_pressure_reaches_deep_retention_before_maximal_fallback() {
             "guided pressure search returned to eager breadth-first assessment");
 }
 
+void test_host_preserving_seed_survives_optional_search_deadline() {
+    FakeManager manager = make_manager(1, 9);
+    FakeProgram program;
+    std::vector<std::uint32_t> device_owners;
+    for (std::uint32_t i = 0; i < 8; ++i) {
+        const auto active = start_active(manager, program, 100 + i, make_base(100 + i), i + 1);
+        const auto id = active.sequence.id;
+        (void)finish_active(manager, program, active);
+        if (i < 3) { device_owners.push_back(id); }
+        else { program.owner_decisions.emplace_back(id, std::vector<FakeTargetDecision>{}); }
+    }
+    program.required_pressure_actions = 3;
+    program.private_pressure_alternatives = 1;
+    // One assessment consumes the busy boundary: a usable incumbent must already retain
+    // host-only entries and demote the three device owners when optional search cannot run.
+    program.pressure_assessment_delay_us = 60'000;
+    auto allowance = ninfer::runtime::PlanningAllowance::boundary(1);
+    auto inspection = manager.inspect(program, FakePreparedPrompt{140}, make_base(140), 20, allowance);
+    require(inspection.choice.has_value(), "host-preserving seed lost admission liveness");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice), FakePreparedPrompt{140}, {});
+    require(program.started_action_ids.size() == 3, "host-only owner was unnecessarily disturbed");
+    for (const auto id : device_owners) {
+        require(std::find(program.started_action_ids.begin(), program.started_action_ids.end(),
+                          1000U + id) != program.started_action_ids.end(),
+                "deadline discarded a device conversation instead of demoting it");
+    }
+}
+
+void test_retention_seed_releases_oldest_when_host_cannot_preserve() {
+    FakeManager manager = make_manager(1, 5);
+    FakeProgram program;
+    std::uint32_t oldest_id = 0;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const auto active = start_active(manager, program, 150 + i, make_base(150 + i), i + 1);
+        if (i == 0) { oldest_id = active.sequence.id; }
+        (void)finish_active(manager, program, active);
+    }
+    program.required_pressure_actions = 1;
+    program.private_pressure_alternatives = 0;
+    program.pressure_assessment_delay_us = 8'000;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{160}, make_base(160), 20,
+                                      ninfer::runtime::PlanningAllowance::boundary(1));
+    require(inspection.choice.has_value(), "capacity pressure lost admission liveness");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice), FakePreparedPrompt{160}, {});
+    require(program.started_action_ids == std::vector<std::uint64_t>{2000U + oldest_id},
+            "fallback sacrificed more than the oldest required conversation");
+}
+
+void test_retention_seed_rejects_cheaper_cache_destruction() {
+    FakeManager manager = make_manager(1, 5);
+    FakeProgram program;
+    std::vector<std::uint64_t> preserve_ids;
+    for (std::uint32_t i = 0; i < 4; ++i) {
+        const auto active = start_active(manager, program, 170 + i, make_base(170 + i), i + 1);
+        const auto id = active.sequence.id;
+        (void)finish_active(manager, program, active);
+        preserve_ids.push_back(1000U + id);
+        program.owner_decisions.emplace_back(id, std::vector<FakeTargetDecision>{
+            {.id = 1000U + id, .immediate_ns = 10'000'000'000ULL},
+            {.id = 2000U + id, .immediate_ns = 0, .dropped_checkpoints = 1,
+             .evicts_continuation = true}});
+    }
+    program.required_pressure_actions = 4;
+    auto inspection = manager.inspect(program, FakePreparedPrompt{180}, make_base(180), 20);
+    require(inspection.choice.has_value(), "retention ceiling lost a feasible admission");
+    program.abort_start = true;
+    (void)manager.reserve_materialization(program, std::move(*inspection.choice), FakePreparedPrompt{180}, {});
+    std::sort(program.started_action_ids.begin(), program.started_action_ids.end());
+    std::sort(preserve_ids.begin(), preserve_ids.end());
+    require(program.started_action_ids == preserve_ids,
+            "optional cost refinement discarded cache despite a verified preserving plan");
+}
+
 void test_combined_target_reprices_cancelled_pressure_copy() {
     FakeManager manager = make_manager(1, 3);
     FakeProgram program;
@@ -3373,10 +3484,12 @@ void test_complete_search_against_small_exhaustive_oracle() {
                     }
                     return std::nullopt;
                 };
-                std::uint64_t oracle = UINT64_MAX;
+                // This local policy prioritizes preserving owners over estimated latency.
+                // Enumerate that objective independently rather than the upstream cost-only one.
+                auto oracle = std::tuple{UINT32_MAX, UINT64_MAX};
                 for (unsigned source = 0; source < 2; ++source) {
                     for (unsigned raw = 0; raw < 27; ++raw) {
-                        unsigned digits = raw, relief = 0;
+                        unsigned digits = raw, relief = 0, evictions = 0;
                         bool frees_slot = false, protects_source = true;
                         std::uint64_t cost                    = (source ? 100 : 800) * ms;
                         std::uint64_t remaining_public_saving = 0;
@@ -3388,6 +3501,7 @@ void test_complete_search_against_small_exhaustive_oracle() {
                             }
                             relief += choice;
                             if (choice == 2) {
+                                ++evictions;
                                 frees_slot = true;
                                 cost += drop[owner] +
                                         rebuild[owner] * weights[(owner + weight_rotation) % 3];
@@ -3402,7 +3516,7 @@ void test_complete_search_against_small_exhaustive_oracle() {
                             continue;
                         }
                         cost += rebuild[0] - remaining_public_saving;
-                        oracle = std::min(oracle, cost);
+                        oracle = std::min(oracle, std::tuple{evictions, cost});
                     }
                 }
                 Planner planner;
@@ -3413,12 +3527,16 @@ void test_complete_search_against_small_exhaustive_oracle() {
                                  inputs, goal, Planner::Clock::now(), allowance);
                 require(result && result->plan,
                         "exhaustive-oracle problem lost its feasible fallback");
-                if (result->diagnostics.predicted_total_ns != oracle) {
+                const auto selected_evictions = static_cast<std::uint32_t>(std::count_if(
+                    result->plan->private_actions.begin(), result->plan->private_actions.end(),
+                    [](const auto& action) { return action.evicts_continuation; }));
+                const auto selected = std::tuple{selected_evictions, result->diagnostics.predicted_total_ns};
+                if (selected != oracle) {
                     std::cerr << "oracle rotation=" << weight_rotation << " relief=" << required
-                              << " full=" << full_catalog << " expected=" << oracle
+                              << " full=" << full_catalog << " expected=" << std::get<1>(oracle)
                               << " selected=" << result->diagnostics.predicted_total_ns << '\n';
                 }
-                require(result->diagnostics.predicted_total_ns == oracle,
+                require(selected == oracle,
                         "complete search missed the independent small-problem optimum");
                 require(
                     std::none_of(result->plan->private_owner_ids.begin(),
@@ -3457,6 +3575,9 @@ void test_publication_only_pressure_constructs_adoptable_target() {
 int main() {
     run_test("independent complete-target oracle",
              test_complete_search_against_small_exhaustive_oracle);
+    run_test("host retention at deadline", test_host_preserving_seed_survives_optional_search_deadline);
+    run_test("bounded oldest-first sacrifice", test_retention_seed_releases_oldest_when_host_cannot_preserve);
+    run_test("retention survives cheaper eviction", test_retention_seed_rejects_cheaper_cache_destruction);
     run_test("publication-only construction",
              test_publication_only_pressure_constructs_adoptable_target);
     run_test("private checkpoint identity loss",

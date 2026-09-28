@@ -568,6 +568,9 @@ public:
     [[nodiscard]] PressureTargetHandle
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] PressureTargetHandle maximal_target(runtime::PlanningCandidateId candidate);
+    // Complete target: evict only the nominated eligible owners, demote the rest where possible.
+    [[nodiscard]] PressureTargetHandle retention_target(
+        runtime::PlanningCandidateId candidate, std::span<const runtime::PlanningOwnerId> evict);
     [[nodiscard]] PressureConstructionCursor begin_construction(PressureTargetHandle target,
                                                                 bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep

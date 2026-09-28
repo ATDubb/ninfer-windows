@@ -40,6 +40,7 @@ struct MaterializationOwnerPolicy {
     std::uint64_t last_hit_epoch           = 0;
     std::uint32_t private_retention_weight = 0;
     bool explicit_shared_credit            = false;
+    std::uint64_t recency_epoch             = 0;
 };
 
 template <class ModelContract, class SearchClock = std::chrono::steady_clock>
@@ -238,31 +239,116 @@ public:
 
         Incumbent incumbent;
         std::uint32_t targets_evaluated = static_cast<std::uint32_t>(candidates.size());
+        std::uint32_t seed_targets = 0;
         if (identity_best) {
             incumbent        = std::move(*identity_best);
             incumbent.target = session.identity_target(candidates[incumbent.candidate_index].id);
         } else {
-            PressureTargetHandle root_maximal =
-                session.root_maximal_target(candidates[root_candidate_index].id);
-            AssessedPressureTarget assessed            = session.assess(root_maximal);
-            const PressureTargetAssessment& assessment = assessed.assessment();
-            if (assessment.candidate != candidates[root_candidate_index].id) {
-                throw std::logic_error("maximal pressure target changed admission candidate");
+            // Establish a useful incumbent before combinatorial search can time out. The
+            // Program proposes complete host-preserving targets; only exact physical AND
+            // logical assessment can accept one. A ladder is an ordering heuristic, never a
+            // feasibility proof: every accepted rung is assessed independently.
+            std::vector<MaterializationOwnerPolicy> oldest(pressure.owner_policy.begin(),
+                                                          pressure.owner_policy.end());
+            std::stable_sort(oldest.begin(), oldest.end(), [](const auto& a, const auto& b) {
+                return a.recency_epoch < b.recency_epoch;
+            });
+            std::vector<PlanningOwnerId> victims;
+            for (const auto& owner : oldest) { victims.push_back(owner.owner); }
+            const auto best_reuse = static_cast<std::uint32_t>(
+                std::min_element(identity_costs_.begin(), identity_costs_.end(),
+                                 [](const auto& a, const auto& b) {
+                                     return a.lower_bound_ns < b.lower_bound_ns;
+                                 }) - identity_costs_.begin());
+            bool seeded = false;
+            std::uint32_t attempts = 0;
+            const auto seed_started = planning_now_ns<Clock>();
+            const auto seed_deadline = seed_started + allowance.remaining(seed_started) / 2;
+            const auto seed = [&](std::uint32_t candidate, std::size_t sacrifice)
+                -> std::optional<bool> {
+                // Reserve half the remaining boundary for the normal demotion/refinement
+                // search. An indivisible assessment may overrun, just as existing sealing can.
+                if (attempts >= 24 || planning_now_ns<Clock>() >= seed_deadline) {
+                    return std::nullopt;
+                }
+                ++attempts;
+                const auto target = session.retention_target(
+                    candidates[candidate].id,
+                    std::span<const PlanningOwnerId>(victims).first(sacrifice));
+                AssessedPressureTarget assessed = session.assess(target);
+                const auto& assessment = assessed.assessment();
+                if (assessment.candidate != candidates[candidate].id) {
+                    throw std::logic_error("retention target changed admission candidate");
+                }
+                if (!target_marked(assessment.stable_target_ordinal, kTargetDiscovered)) {
+                    ++seed_targets;
+                }
+                mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                std::optional<LogicalGoal> goal;
+                if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+                    goal = logical_goal(assessment.candidate, assessment.source_mode,
+                                        assessment.owner_outcomes);
+                }
+                if (!goal) { return false; }
+                candidate_seeded[candidate] = true;
+                mark_target(assessment.stable_target_ordinal, kTargetFeasible);
+                const auto cost = fold_assessment(candidates[candidate], assessment,
+                    pressure.owner_policy, pressure.checkpoint_policy, machine_cost);
+                if (!seeded || cost.retention_less(incumbent.cost)) {
+                    incumbent = make_incumbent(target, candidate, assessment,
+                                               std::move(assessed), cost, *goal);
+                    seeded = true;
+                }
+                return true;
+            };
+            for (const auto candidate : {best_reuse, root_candidate_index}) {
+                const auto zero = seed(candidate, 0);
+                if (!zero) { break; }
+                if (*zero) { if (candidate == root_candidate_index) { break; } continue; }
+                std::size_t low = 0, high = 1;
+                bool found = false;
+                while (high <= victims.size()) {
+                    const auto result = seed(candidate, high);
+                    if (!result) { break; }
+                    if (*result) { found = true; break; }
+                    low = high;
+                    if (high == victims.size()) { break; }
+                    high = std::min(victims.size(), high * 2);
+                }
+                // Tighten only among verified rungs. Non-monotonic allocator geometry can
+                // miss an opportunity, but can never admit an unverified target.
+                while (found && high > low + 1) {
+                    const auto mid = low + (high - low) / 2;
+                    const auto result = seed(candidate, mid);
+                    if (!result) { break; }
+                    if (*result) { high = mid; } else { low = mid; }
+                }
+                if (candidate == root_candidate_index) { break; }
             }
-            ++targets_evaluated;
-            planning_saturating_add(projection_work, assessment.projection_work);
-            std::optional<LogicalGoal> goal;
-            if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
-                goal = logical_goal(assessment.candidate, assessment.source_mode,
-                                    assessment.owner_outcomes);
+            if (!seeded) {
+                PressureTargetHandle root_maximal =
+                    session.root_maximal_target(candidates[root_candidate_index].id);
+                AssessedPressureTarget assessed = session.assess(root_maximal);
+                const PressureTargetAssessment& assessment = assessed.assessment();
+                if (assessment.candidate != candidates[root_candidate_index].id) {
+                    throw std::logic_error("maximal pressure target changed admission candidate");
+                }
+                ++targets_evaluated;
+                planning_saturating_add(projection_work, assessment.projection_work);
+                std::optional<LogicalGoal> goal;
+                if (assessment.physical_status == MaterializationPhysicalStatus::Feasible) {
+                    goal = logical_goal(assessment.candidate, assessment.source_mode,
+                                        assessment.owner_outcomes);
+                }
+                if (!goal) { return std::nullopt; }
+                const FoldedCost cost = fold_assessment(candidates[root_candidate_index], assessment,
+                    pressure.owner_policy, pressure.checkpoint_policy, machine_cost);
+                incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
+                                           std::move(assessed), cost, *goal);
+                mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
             }
-            if (!goal) { return std::nullopt; }
-            const FoldedCost cost =
-                fold_assessment(candidates[root_candidate_index], assessment, pressure.owner_policy,
-                                pressure.checkpoint_policy, machine_cost);
-            incumbent = make_incumbent(root_maximal, root_candidate_index, assessment,
-                                       std::move(assessed), cost, *goal);
-            mark_target(assessment.stable_target_ordinal, kTargetDiscovered | kTargetAssessed);
         }
 
         if (!identity_best) { search_started = Clock::now(); }
@@ -279,7 +365,7 @@ public:
         std::uint64_t search_work       = 0;
         const auto work_limit           = static_cast<std::uint64_t>(kTargetBudget) *
                                 (16U + 16ULL * pressure.owner_policy.size());
-        std::uint32_t optional_targets        = 0;
+        std::uint32_t optional_targets        = seed_targets;
         MaterializationStopReason stop_reason = MaterializationStopReason::QueueExhausted;
         bool budget_exhausted                 = false;
         auto search_phase                     = MaterializationSearchPhase::Setup;
@@ -372,7 +458,12 @@ public:
                 mark_target(assessment.stable_target_ordinal, kTargetFeasible);
                 candidate_seeded[expected_candidate] = true;
             }
-            if (goal && cost.less(incumbent.cost)) {
+            // Once a feasible preservation plan exists, faster admission is not evidence
+            // that losing more cached conversations/checkpoints is necessary. Keep this
+            // destructive-impact ceiling separate from the optimistic search ordering.
+            if (goal && cost.owner_evictions <= incumbent.cost.owner_evictions &&
+                cost.checkpoint_drops <= incumbent.cost.checkpoint_drops &&
+                cost.retention_less(incumbent.cost)) {
                 if (cost.total_ns < initial_cost_ns && !first_improvement_ns) {
                     first_improvement_ns = elapsed_ns(search_started, Clock::now());
                 }
@@ -808,6 +899,11 @@ private:
 
         [[nodiscard]] bool less(const FoldedCost& other) const noexcept {
             return key() < other.key();
+        }
+
+        [[nodiscard]] bool retention_less(const FoldedCost& other) const noexcept {
+            return std::tuple{owner_evictions, checkpoint_drops, key()} <
+                   std::tuple{other.owner_evictions, other.checkpoint_drops, other.key()};
         }
     };
 

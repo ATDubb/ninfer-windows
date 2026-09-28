@@ -1015,13 +1015,19 @@ private:
     protected_materialization_page(const MaterializationSourceProtection* protection,
                                    const KVAddressSpaceStore& addresses, std::uint32_t page_offset,
                                    LogicalKVPageHandle page, bool backend) const;
+    struct PressureReplicaExclusions {
+        std::vector<StateImageHandle> states;
+        std::vector<LogicalKVPageHandle> main_pages;
+        std::vector<LogicalKVPageHandle> backend_pages;
+    };
     [[nodiscard]] std::optional<qwen3_5::detail::PressureDecision>
     inspect_pressure_option(const SequenceState& sequence, detail::PhysicalResources deficit,
                             const MaterializationSourceProtection* protection           = nullptr,
                             const qwen3_5::TargetKVRequirement* retained_requirement    = nullptr,
                             std::span<const runtime::CheckpointRef> dropped_checkpoints = {},
                             std::span<const StateImageHandle> released_states           = {},
-                            const qwen3_5::detail::PressureDecision* current = nullptr) const;
+                            const qwen3_5::detail::PressureDecision* current = nullptr,
+                            const PressureReplicaExclusions* exclusions = nullptr) const;
     [[nodiscard]] std::vector<qwen3_5::detail::PressureDecision>
     inspect_pressure_successors(const SequenceState& sequence, detail::PhysicalResources residual,
                                 const MaterializationSourceProtection* protection,
@@ -1033,7 +1039,8 @@ private:
     [[nodiscard]] std::optional<qwen3_5::detail::PressureDecision> inspect_shared_pressure_option(
         const SharedPrefixState& shared, detail::PhysicalResources deficit,
         const MaterializationSourceProtection* protection = nullptr,
-        const qwen3_5::detail::PressureDecision* current  = nullptr) const;
+        const qwen3_5::detail::PressureDecision* current  = nullptr,
+        const PressureReplicaExclusions* exclusions = nullptr) const;
     [[nodiscard]] std::vector<qwen3_5::detail::PressureDecision> inspect_shared_pressure_options(
         const SharedPrefixState& shared, detail::PhysicalResources deficit,
         const MaterializationSourceProtection* protection = nullptr,
@@ -1227,6 +1234,7 @@ struct PressurePlanningSessionImpl {
         std::uint32_t owner_index = 0;
         std::vector<PressureDecision> decisions;
         std::uint16_t eviction_choice = 0;
+        std::uint16_t preserve_choice = 0;
     };
 
     struct CandidateOptions {
@@ -1283,6 +1291,8 @@ struct PressurePlanningSessionImpl {
     root_maximal_target(runtime::PlanningCandidateId root_candidate);
     [[nodiscard]] qwen3_5::PressureTargetHandle
     maximal_target(runtime::PlanningCandidateId candidate);
+    [[nodiscard]] qwen3_5::PressureTargetHandle retention_target(
+        runtime::PlanningCandidateId candidate, std::span<const runtime::PlanningOwnerId> evict);
     [[nodiscard]] qwen3_5::PressureConstructionCursor
     begin_construction(qwen3_5::PressureTargetHandle target, bool restore = false);
     [[nodiscard]] runtime::PressureConstructionStep

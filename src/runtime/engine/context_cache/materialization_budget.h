@@ -29,7 +29,7 @@ struct PlanningAllowance {
     [[nodiscard]] static PlanningAllowance
     boundary(std::uint32_t other_runnable, std::uint64_t now = planning_now_ns()) noexcept {
         return {.started_ns        = now,
-                .limit_ns          = other_runnable == 0 ? 50'000'000ULL : 10'000'000ULL,
+                .limit_ns          = 50'000'000ULL,
                 .affected_requests = 1U + other_runnable};
     }
 
@@ -51,7 +51,7 @@ public:
                                 std::uint64_t initial_cost) noexcept
         : allowance_(allowance), started_(started),
           granted_(std::min(
-              {std::uint64_t{5'000'000}, economic(initial_cost), allowance.remaining(started)})) {}
+              {std::uint64_t{50'000'000}, economic(initial_cost), allowance.remaining(started)})) {}
 
     [[nodiscard]] bool allow(std::uint64_t now, std::uint64_t next_operation_ns,
                              std::uint64_t completion_ns, std::uint64_t gain_ns,

@@ -521,7 +521,8 @@ bool ProgramImpl::protected_materialization_page(const MaterializationSourceProt
 std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_pressure_option(
     const SharedPrefixState& shared, detail::PhysicalResources deficit,
     const MaterializationSourceProtection* protection,
-    const qwen3_5::detail::PressureDecision* current) const {
+    const qwen3_5::detail::PressureDecision* current,
+    const PressureReplicaExclusions* exclusions) const {
     if (!shared.kv || shared.active_references != 0 || deficit.device.active_lanes != 0 ||
         (current != nullptr && (current->evicts_continuation || !current->shared_owner))) {
         return std::nullopt;
@@ -556,6 +557,7 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_pre
     qwen3_5::detail::PressureStateDecision state_change =
         qwen3_5::detail::PressureStateDecision::None;
     if (option.state_changes.empty() &&
+        (!exclusions || std::find(exclusions->states.begin(), exclusions->states.end(), shared.state) == exclusions->states.end()) &&
         (deficit.device.state_slots != 0 || deficit.host.state_slots != 0) &&
         state_store->valid(shared.state) &&
         state_store->role(shared.state) == StateImageRole::CheckpointImmutable &&
@@ -600,6 +602,10 @@ std::optional<qwen3_5::detail::PressureDecision> ProgramImpl::inspect_shared_pre
             requested, host_kv_remaining, resource, changes,
             [&](std::uint32_t page, LogicalKVPageHandle logical,
                 qwen3_5::detail::PressureKVDecisionKind action) {
+                if (exclusions) {
+                    const auto& excluded = backend ? exclusions->backend_pages : exclusions->main_pages;
+                    if (std::find(excluded.begin(), excluded.end(), logical) != excluded.end()) { return true; }
+                }
                 return action != qwen3_5::detail::PressureKVDecisionKind::DropHostDuplicate &&
                        protected_materialization_page(protection, addresses, page, logical,
                                                       backend);
@@ -708,7 +714,8 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
                                      const qwen3_5::TargetKVRequirement* retained_requirement,
                                      std::span<const runtime::CheckpointRef> dropped_checkpoints,
                                      std::span<const StateImageHandle> released_states,
-                                     const qwen3_5::detail::PressureDecision* current) const {
+                                     const qwen3_5::detail::PressureDecision* current,
+                                     const PressureReplicaExclusions* exclusions) const {
     if (!sequence.kv || deficit.device.active_lanes != 0 ||
         (current != nullptr && current->evicts_continuation)) {
         return std::nullopt;
@@ -749,6 +756,9 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
     mix_kv(option.main_kv_changes, 0x4d41494eULL);
     mix_kv(option.backend_kv_changes, 0x4241434bULL);
     const auto add_state = [&](StateImageHandle state, bool rewrite) {
+        if (exclusions && std::find(exclusions->states.begin(), exclusions->states.end(), state) != exclusions->states.end()) {
+            return false;
+        }
         const bool checkpoint_was_dropped = std::any_of(
             dropped_checkpoints.begin(), dropped_checkpoints.end(),
             [&](runtime::CheckpointRef checkpoint) {
@@ -834,6 +844,10 @@ ProgramImpl::inspect_pressure_option(const SequenceState& sequence,
             requested, host_kv_remaining, resource, changes,
             [&](std::uint32_t page, LogicalKVPageHandle logical,
                 qwen3_5::detail::PressureKVDecisionKind action) {
+                if (exclusions) {
+                    const auto& excluded = backend ? exclusions->backend_pages : exclusions->main_pages;
+                    if (std::find(excluded.begin(), excluded.end(), logical) != excluded.end()) { return true; }
+                }
                 return action != qwen3_5::detail::PressureKVDecisionKind::DropHostDuplicate &&
                        protected_materialization_page(protection, addresses, page, logical,
                                                       backend);

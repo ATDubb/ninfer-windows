@@ -744,7 +744,28 @@ lane 或 open transaction 阻塞，结果为 temporarily blocked。
 ### 8.7 有界 heuristic search
 
 Materialization 与 shared capture 使用两个 typed entrypoint。Materialization 的 incumbent 是已验证
-identity 或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
+identity、经验证的 host-preserving retention target，或最后保底的 root maximal；shared capture 的 incumbent 是 Skip，只有 exact `NetGain>0` 才替换。
+
+Before ordinary materialization search, a bounded retention ladder proposes demotion of eligible
+private and shared owners to Host. Host-only owners remain unchanged. If physical or publication
+capacity still prevents admission, sacrifice an increasing oldest-first set, then narrow a feasible
+interval. Recency includes publication and subsequent hits. Each rung is independently checked by
+the same exact physical and logical evaluator; interval narrowing is a heuristic, not a proof of
+monotonic feasibility. Try the lowest request-cost bound and root candidates, with at most 24
+assessments and half the remaining boundary. Preserve the verified incumbent when time expires;
+use root maximal only when no retention target was accepted. The selected source remains absent
+from the victim domain and active/pinned owners remain protected.
+
+Program builds the collective demotion proposal with replica exclusions accumulated across
+owners: a shared physical page/state is targeted only once. This prevents alias conflicts between
+per-owner publications. Exact joint projection still rejects duplicate physical targets; neither
+resource accounting nor execution validity is relaxed to make the seed feasible.
+
+Local desktop retention policy: rank verified ladder targets by owner evictions, then checkpoint
+drops, then the existing cost key. Optional refinement cannot increase either destructive count
+above the current verified incumbent. This deliberately trades some admission/transfer cost for
+longer cache retention; it is a bounded heuristic, not a global minimum-eviction proof. Existing
+cost bounds still guide optional discovery and do not prove optimality under this preference.
 
 一次 planning problem 中：
 
@@ -763,7 +784,9 @@ identity 或 root maximal；shared capture 的 incumbent 是 Skip，只有 exact
 真实资源 mutation。结束搜索后不跨 decode/prefill 恢复旧状态。
 
 Engine 提供 admission boundary 共享的 optional 时间额度，head/backfill inspections 不能各自重置。
-预算考虑其他 runnable 请求及本 boundary 已花费的时间。Planner 先用短窗口搜索，再根据尚可获得
+预算考虑其他 runnable 请求及本 boundary 已花费的时间。Idle boundary is 50 ms; a boundary
+with other runnable requests is also 50 ms. The initial grant is bounded by incumbent cost / 20 /
+affected requests and remaining boundary, with no unconditional minimum. Planner 再根据尚可获得
 的预计改善和完成成本决定是否续额；不完整预测只有受限探索机会，已实现收益不能反复用于续额。
 Target、工作量和 session storage 仍独立有界。
 

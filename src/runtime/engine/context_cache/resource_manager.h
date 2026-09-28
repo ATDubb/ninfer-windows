@@ -975,6 +975,7 @@ public:
 
         release_active_references(lane);
         publication.state = CatalogState::Catalogued;
+        publication.published_epoch = ++retention_epoch_;
         assign_continuation_summary(publication.summary, result.summary);
         publication.handle.emplace(std::move(*result.continuation));
         result.continuation.reset();
@@ -1161,6 +1162,7 @@ private:
         std::optional<CacheSessionKey> session;
         std::vector<CheckpointObservation> observations;
         RetentionClass retention = RetentionClass::RecentPrivate;
+        std::uint64_t published_epoch = 0;
     };
 
     struct SharedCatalogEntry {
@@ -1173,6 +1175,7 @@ private:
         std::uint32_t transaction_pins    = 0;
         bool explicit_credit              = false;
         std::uint64_t credit_expiry_epoch = 0;
+        std::uint64_t published_epoch = 0;
     };
 
     enum class SessionIndexState : std::uint8_t {
@@ -1561,6 +1564,7 @@ private:
         entry.session.reset();
         entry.observations.clear();
         entry.retention = RetentionClass::RecentPrivate;
+        entry.published_epoch = 0;
         advance_revision(entry.revision);
     }
 
@@ -1573,6 +1577,7 @@ private:
         entry.transaction_pins    = 0;
         entry.explicit_credit     = false;
         entry.credit_expiry_epoch = 0;
+        entry.published_epoch = 0;
         advance_revision(entry.revision);
     }
 
@@ -1925,6 +1930,7 @@ private:
                     .selected_hit_count       = selected_hits,
                     .last_hit_epoch           = newest_hit_epoch(entry),
                     .private_retention_weight = private_retention_weight(entry.retention),
+                    .recency_epoch = std::max(entry.published_epoch, newest_hit_epoch(entry)),
                 });
             }
             for (std::uint32_t slot = 0; slot < shared_catalog_count_; ++slot) {
@@ -1957,6 +1963,7 @@ private:
                     .last_hit_epoch           = entry.observation.last_hit_epoch,
                     .private_retention_weight = 0,
                     .explicit_shared_credit   = entry.explicit_credit,
+                    .recency_epoch = std::max(entry.published_epoch, entry.observation.last_hit_epoch),
                 });
                 checkpoint_policies.push_back(MaterializationCheckpointPolicy{
                     .owner              = owner,
@@ -3088,6 +3095,7 @@ private:
             publication.handle.reset();
             publication.state = SharedCatalogState::Catalogued;
             publication.id    = next_shared_prefix_id_++;
+            publication.published_epoch = ++retention_epoch_;
             if (publication.id == 0) { publication.id = next_shared_prefix_id_++; }
             publication.summary                   = result.shared->summary;
             publication.summary.active_references = 0;

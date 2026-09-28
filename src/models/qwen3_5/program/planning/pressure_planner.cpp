@@ -386,6 +386,9 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
     if (!protection) {
         throw std::logic_error("pressure planning candidate source protection is stale");
     }
+    // Per-owner pressure is published sequentially. A replica shared by several
+    // owners must occur in only one option, or exact projection rejects the target.
+    Core::PressureReplicaExclusions exclusions;
     for (CandidateVictimOptions& victim : options.victims) {
         if (victim.owner_index >= owners.size()) {
             throw std::logic_error("pressure planning victim owner is invalid");
@@ -412,6 +415,65 @@ void PressurePlanningSessionImpl::populate_options(std::uint32_t selected_candid
             throw std::overflow_error("pressure owner target count is not representable");
         }
         victim.eviction_choice = static_cast<std::uint16_t>(decisions.size());
+        // Adapted from Wallawalla47/ninfer-custom 6fe061d3: offer host preservation for
+        // private AND shared owners. This is only a proposal; assess() certifies joint fit,
+        // aliasing, source protection, and transfer-stage peaks before anything is committed.
+        detail::PhysicalResources device_pressure;
+        device_pressure.device.state_slots = std::numeric_limits<std::uint32_t>::max();
+        device_pressure.device.main_kv_pages = std::numeric_limits<std::uint32_t>::max();
+        device_pressure.device.backend_kv_pages = std::numeric_limits<std::uint32_t>::max();
+        std::optional<PressureDecision> preserve;
+        if (owner.shared) {
+            preserve = program->inspect_shared_pressure_option(
+                program->shared_prefix_states[PlanningContractAccess::index(*owner.shared_handle)],
+                device_pressure, &*protection, nullptr, &exclusions);
+        } else {
+            preserve = program->inspect_pressure_option(
+                program->continuation_states[PlanningContractAccess::index(*owner.private_handle)],
+                device_pressure, &*protection, nullptr, {}, {}, nullptr, &exclusions);
+        }
+        if (preserve && !preserve->evicts_continuation &&
+            (preserve->effect.removed.device.state_slots ||
+             preserve->effect.removed.device.main_kv_pages ||
+             preserve->effect.removed.device.backend_kv_pages)) {
+            const auto* sequence = owner.shared ? nullptr :
+                &program->continuation_states[PlanningContractAccess::index(*owner.private_handle)];
+            const auto* shared = owner.shared ?
+                &program->shared_prefix_states[PlanningContractAccess::index(*owner.shared_handle)] : nullptr;
+            for (const auto action : preserve->state_changes) {
+                if (shared) { exclusions.states.push_back(shared->state); continue; }
+                switch (action) {
+                case PressureStateDecision::DropEndpointDeviceDuplicate:
+                case PressureStateDecision::DemoteEndpointToHost:
+                case PressureStateDecision::DropEndpointHostDuplicate:
+                    exclusions.states.push_back(sequence->state.read);
+                    break;
+                case PressureStateDecision::DropRewriteDeviceDuplicate:
+                case PressureStateDecision::DemoteRewriteToHost:
+                case PressureStateDecision::DropRewriteHostDuplicate:
+                    exclusions.states.push_back(*sequence->rewrite_state);
+                    break;
+                default: throw std::logic_error("preserving pressure has no state source");
+                }
+            }
+            const auto& kv = owner.shared ? *shared->kv : *sequence->kv;
+            const auto claim_pages = [&](const auto& changes, const auto& addresses,
+                                         auto address, auto& claimed) {
+                for (const auto& action : changes) {
+                    for (std::uint32_t offset = 0; offset < action.page_count; ++offset) {
+                        claimed.push_back(addresses.logical_page(address, action.begin_page + offset));
+                    }
+                }
+            };
+            claim_pages(preserve->main_kv_changes, *program->text_kv_addresses,
+                        kv.text, exclusions.main_pages);
+            if (kv.backend) {
+                claim_pages(preserve->backend_kv_changes, *program->backend_kv_addresses,
+                            *kv.backend, exclusions.backend_pages);
+            }
+            decisions.push_back(std::move(*preserve));
+            victim.preserve_choice = static_cast<std::uint16_t>(decisions.size());
+        }
     }
     options.populated = true;
 }
@@ -483,6 +545,30 @@ PressurePlanningSessionImpl::maximal_target(runtime::PlanningCandidateId id) {
     result.session_    = this;
     result.generation_ = generation;
     result.index_      = index;
+    return result;
+}
+
+qwen3_5::PressureTargetHandle PressurePlanningSessionImpl::retention_target(
+    runtime::PlanningCandidateId id, std::span<const runtime::PlanningOwnerId> evict) {
+    if (scratch_live) { throw std::logic_error("pressure expansion scratch is live"); }
+    const auto selected = candidate_index(id);
+    populate_options(selected);
+    choice_scratch.clear();
+    // The candidate's source is excluded from victims by the session constructor.
+    // Zero means unchanged, including host-only owners with no demotion to perform.
+    bool all_evicted = !candidate_options[selected].victims.empty();
+    for (const auto& victim : candidate_options[selected].victims) {
+        const auto owner = owners[victim.owner_index].id;
+        const bool release = std::find(evict.begin(), evict.end(), owner) != evict.end();
+        choice_scratch.push_back(release ? victim.eviction_choice : victim.preserve_choice);
+        all_evicted = all_evicted && release;
+    }
+    // Do not make an all-release rung disappear from maximal-fallback telemetry.
+    const auto index = intern_target(selected, choice_scratch, all_evicted);
+    qwen3_5::PressureTargetHandle result;
+    result.session_ = this;
+    result.generation_ = generation;
+    result.index_ = index;
     return result;
 }
 

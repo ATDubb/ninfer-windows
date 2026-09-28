@@ -13,7 +13,16 @@ int main() {
     constexpr std::uint64_t ms = 1'000'000;
     try {
         auto idle = PlanningAllowance::boundary(0, 0);
-        MaterializationSearchBudget expensive(idle, 0, 80'000 * ms);
+        require(MaterializationSearchBudget(idle, 0, 80'000 * ms).granted_ns() == 50 * ms,
+                "expensive admission retained the premature discovery window");
+        auto concurrent = PlanningAllowance::boundary(1, 0);
+        MaterializationSearchBudget long_search(concurrent, 0, 80'000 * ms);
+        require(long_search.granted_ns() == 50 * ms &&
+                    long_search.allow(11 * ms, ms, 4 * ms, 70'000 * ms, false, 2),
+                "incomplete valuable search was stopped after one discovery episode");
+        require(!long_search.allow(50 * ms, 1, 1, 70'000 * ms, true, 3),
+                "concurrent search exceeded the boundary");
+        MaterializationSearchBudget expensive(idle, 0, 100 * ms);
         require(expensive.allow(4 * ms, 2 * ms, 3 * ms, 70'000 * ms, true, 1),
                 "valuable completion could not cross the initial window");
         require(expensive.granted_ns() == 10 * ms && expensive.renewals() == 1,
@@ -24,7 +33,7 @@ int main() {
                     ninfer::MaterializationStopReason::InsufficientExpectedGain,
                 "economic stopping was reported as wall exhaustion");
 
-        MaterializationSearchBudget discovery(idle, 0, 80'000 * ms);
+        MaterializationSearchBudget discovery(idle, 0, 100 * ms);
         require(discovery.allow(5 * ms, ms, 4 * ms, 70'000 * ms, false, 1),
                 "unknown candidate could not receive bounded discovery");
         require(!discovery.allow(10 * ms, ms, ms, 70'000 * ms, false, 2),
@@ -56,7 +65,7 @@ int main() {
         MaterializationSearchBudget saturated(idle, 0, UINT64_MAX);
         require(saturated.granted_ns() == 0 && !saturated.allow(0, ms, ms, UINT64_MAX, true, 1),
                 "saturated cost was used as evidence of unlimited gain");
-        MaterializationSearchBudget seeded(idle, 0, 80'000 * ms);
+        MaterializationSearchBudget seeded(idle, 0, 100 * ms);
         require(!seeded.allow(5 * ms, ms, ms, 70'000 * ms, false, 1, false),
                 "an already-seeded candidate renewed solely on an incomplete optimistic estimate");
         require(seeded.allow(5 * ms, ms, ms, 70'000 * ms, true, 1, false),
@@ -68,7 +77,7 @@ int main() {
         require(controlled.remaining(2 * ms) == ms, "control deadline did not constrain planning");
         cancelled.store(true);
         require(controlled.remaining(0) == 0, "cancelled request kept optional planning headroom");
-        MaterializationSearchBudget stalled(idle, 0, 80'000 * ms);
+        MaterializationSearchBudget stalled(idle, 0, 100 * ms);
         require(stalled.allow(5 * ms, ms, ms, 70'000 * ms, true, 7), "first forecast grant failed");
         require(!stalled.allow(10 * ms, ms, ms, 70'000 * ms, true, 7),
                 "stalled work renewed its allowance");
